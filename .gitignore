@@ -12,3 +12,11 @@ __pycache__/
 
 # VS Code settings
 .vscode/
+build/
+dist/
+*.spec
+venv/
+build/
+dist/
+*.spec
+__pycache__/

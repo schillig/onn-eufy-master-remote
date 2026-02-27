@@ -6,8 +6,10 @@ import time
 import threading
 import websocket
 from PyQt6.QtWidgets import (QApplication, QWidget, QPushButton, QGridLayout, 
-                             QVBoxLayout, QLabel, QHBoxLayout, QInputDialog, QLineEdit, QMenu)
+                             QVBoxLayout, QLabel, QHBoxLayout, QInputDialog, QLineEdit, QMenu,
+                             QSystemTrayIcon, QStyle)
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
+from PyQt6.QtGui import QIcon
 
 # Silence the accessibility warning in the terminal
 os.environ["QT_LINUX_ACCESSIBILITY_ALWAYS_ON"] = "0"
@@ -75,17 +77,21 @@ class EufyWebsocketWorker(QThread):
         self.running = True
         self.ffmpeg_process = None
         self.recording_active = False
+        self.serial_number = None
+        self.retry_timer = None
+        self.stop_timer = None
+        self.retries = 0
 
     def run(self):
         websocket.enableTrace(False)
-        self.ws = websocket.WebSocketApp(
-            "ws://127.0.0.1:3000",
-            on_open=self.on_open,
-            on_message=self.on_message,
-            on_error=self.on_error,
-            on_close=self.on_close
-        )
         while self.running:
+            self.ws = websocket.WebSocketApp(
+                "ws://127.0.0.1:3000",
+                on_open=self.on_open,
+                on_message=self.on_message,
+                on_error=self.on_error,
+                on_close=self.on_close
+            )
             self.ws.run_forever()
             if self.running:
                 self.log_signal.emit("Reconnecting...")
@@ -101,41 +107,79 @@ class EufyWebsocketWorker(QThread):
         if data.get("type") == "event":
             event = data.get("event", {})
             event_type = event.get("event")
+            
             if event_type == "motion detected" and event.get("state") is True:
+                self.serial_number = event.get("serialNumber")
+                if not self.recording_active:
+                    self.retries = 0
+                    self.motion_signal.emit(True)
+                    self.log_signal.emit("REC: Waking Camera...")
+                    self.request_stream()
+
+            elif event_type == "livestream video data":
                 if not self.recording_active:
                     self.start_recording_process()
-                    self.motion_signal.emit(True)
-                    self.log_signal.emit("REC: Motion Detected")
-                    ws.send(json.dumps({
-                        "messageId": "trigger_live",
-                        "command": "device.start_livestream",
-                        "serialNumber": event.get("serialNumber")
-                    }))
-            elif event_type == "livestream video data":
                 if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
                     video_bytes = bytes(event.get("buffer", {}).get("data", []))
                     self.ffmpeg_process.stdin.write(video_bytes)
                     self.ffmpeg_process.stdin.flush()
+
             elif event_type == "livestream audio data":
                 if self.ffmpeg_process and self.ffmpeg_process.poll() is None:
                     audio_bytes = bytes(event.get("buffer", {}).get("data", []))
                     self.ffmpeg_process.stdin.write(audio_bytes)
                     self.ffmpeg_process.stdin.flush()
-            elif event_type in ["livestream stopped", "livestream error"]:
+
+            elif event_type == "livestream error":
+                self.log_signal.emit("P2P Error. Retrying...")
+
+            elif event_type in ["livestream stopped"]:
                 self.stop_recording_process()
 
+    def request_stream(self):
+        if self.ws and self.serial_number:
+            self.ws.send(json.dumps({
+                "messageId": "trigger_live",
+                "command": "device.start_livestream",
+                "serialNumber": self.serial_number
+            }))
+            if self.retry_timer:
+                self.retry_timer.cancel()
+            self.retry_timer = threading.Timer(6.0, self.check_retry)
+            self.retry_timer.start()
+
+    def check_retry(self):
+        if self.running and not self.recording_active and self.serial_number:
+            if self.retries < 3:
+                self.retries += 1
+                self.log_signal.emit(f"REC: Retry Wake Up ({self.retries}/3)...")
+                self.request_stream()
+            else:
+                self.log_signal.emit("Camera Unreachable.")
+                self.motion_signal.emit(False)
+                self.retries = 0
+
     def start_recording_process(self):
+        if self.retry_timer:
+            self.retry_timer.cancel() 
         timestamp = time.strftime("%Y%m%d-%H%M%S")
         filepath = os.path.join(RECORD_DIR, f"eufy_{timestamp}.mp4")
         cmd = ["ffmpeg", "-y", "-i", "pipe:0", "-c", "copy", "-f", "mp4", "-movflags", "frag_keyframe+empty_moov", filepath]
         try:
             self.ffmpeg_process = subprocess.Popen(cmd, stdin=subprocess.PIPE, stderr=subprocess.DEVNULL)
             self.recording_active = True
-            threading.Timer(30.0, self.stop_recording_process).start()
+            self.log_signal.emit("REC: Stream Active")
+            if self.stop_timer:
+                self.stop_timer.cancel()
+            self.stop_timer = threading.Timer(30.0, self.stop_recording_process)
+            self.stop_timer.start()
         except Exception as e:
             print(f"FFmpeg Spawn Error: {e}")
 
     def stop_recording_process(self):
+        self.retries = 0
+        if self.retry_timer: self.retry_timer.cancel()
+        if self.stop_timer: self.stop_timer.cancel()
         if self.recording_active:
             self.recording_active = False
             if self.ffmpeg_process:
@@ -147,6 +191,14 @@ class EufyWebsocketWorker(QThread):
                 self.ffmpeg_process = None
             self.motion_signal.emit(False)
             self.log_signal.emit("Standby.")
+            if self.ws and self.serial_number:
+                try:
+                    self.ws.send(json.dumps({
+                        "messageId": "stop_live",
+                        "command": "device.stop_livestream",
+                        "serialNumber": self.serial_number
+                    }))
+                except: pass
 
     def on_error(self, ws, error): self.log_signal.emit(f"Error: {error}")
     def on_close(self, ws, a, b): self.stop_recording_process()
@@ -159,14 +211,60 @@ class EufyWebsocketWorker(QThread):
 class OnnMasterRemote(QWidget):
     def __init__(self):
         super().__init__()
+        self.is_quitting = False  # Track if we are actually closing
         self.load_settings()
         self.client = AdbClient(host="127.0.0.1", port=5037)
         self.device = None
-        self.monitor_thread = None
+        
+        self.monitor_thread = EufyWebsocketWorker()
+        self.monitor_thread.motion_signal.connect(self.update_rec_status)
+        self.monitor_thread.log_signal.connect(self.update_cam_status)
+        self.monitor_thread.start()
+        
         self.init_ui()
+        self.setup_tray() # Build the system tray icon
         self.connect_to_device()
+        
         if self.always_on_top:
             self.setWindowFlag(Qt.WindowType.WindowStaysOnTopHint, True)
+
+    def setup_tray(self):
+        self.tray_icon = QSystemTrayIcon(self)
+        
+        # Tap into Linux Mint's native TV/Monitor icon!
+        tv_icon = QIcon.fromTheme("video-display")
+        self.tray_icon.setIcon(tv_icon)
+        self.setWindowIcon(tv_icon) # Fixes the main window taskbar icon too!
+        
+        tray_menu = QMenu()
+        show_action = tray_menu.addAction("Show Remote")
+        show_action.triggered.connect(self.show)
+        
+        hide_action = tray_menu.addAction("Hide to Tray")
+        hide_action.triggered.connect(self.hide)
+        
+        tray_menu.addSeparator()
+        
+        quit_action = tray_menu.addAction("Quit Application")
+        quit_action.triggered.connect(self.quit_app)
+        
+        self.tray_icon.setContextMenu(tray_menu)
+        self.tray_icon.show()
+        
+        # Double-clicking the tray icon opens the UI
+        self.tray_icon.activated.connect(self.on_tray_click)
+
+    def on_tray_click(self, reason):
+        if reason == QSystemTrayIcon.ActivationReason.DoubleClick:
+            self.show()
+            self.activateWindow()
+
+    def quit_app(self):
+        self.is_quitting = True
+        if self.monitor_thread:
+            self.monitor_thread.stop()
+            self.monitor_thread.wait()
+        QApplication.quit()
 
     def load_settings(self):
         self.ip = "192.168.50.94"
@@ -186,12 +284,9 @@ class OnnMasterRemote(QWidget):
         except Exception as e: print(f"Save error: {e}")
 
     def init_ui(self):
-        self.setWindowTitle("ONN Master Control")
-        
-        # INCREASED WIDTH AND FORCED MINIMUM TO PREVENT COMPRESSION
+        self.setWindowTitle("ONN Master Control v1.05")
         self.setFixedWidth(450)
         self.setMinimumWidth(450)
-        
         self.setFocusPolicy(Qt.FocusPolicy.StrongFocus) 
         self.setStyleSheet("""
             QWidget { background-color: #121212; color: #eee; font-family: 'Segoe UI'; }
@@ -201,27 +296,20 @@ class OnnMasterRemote(QWidget):
             QMenu { background-color: #222; border: 1px solid #444; }
             .PowerOn { background-color: #1b5e20; }
             .PowerOff { background-color: #b71c1c; }
-            .CamActive { background-color: #0277bd; font-weight: bold; }
             .ActionBtn { background-color: #444; font-weight: bold; }
         """)
 
         layout = QVBoxLayout()
         sec_layout = QVBoxLayout()
         sec_row = QHBoxLayout()
+        
         self.rec_light = QLabel("● REC")
         self.rec_light.setStyleSheet("color: #444; font-weight: bold;")
-        self.cam_status = QLabel("Standby.")
-        
-        self.btn_monitor = QPushButton("Enable Camera Monitor")
-        self.btn_monitor.setCheckable(True)
-        self.btn_monitor.setFocusPolicy(Qt.FocusPolicy.NoFocus) 
-        self.btn_monitor.toggled.connect(self.toggle_monitor)
-        self.btn_monitor.setChecked(True) 
+        self.cam_status = QLabel("Connecting to Bridge...")
         
         sec_row.addWidget(self.rec_light)
         sec_row.addWidget(self.cam_status)
         sec_layout.addLayout(sec_row)
-        sec_layout.addWidget(self.btn_monitor)
         layout.addLayout(sec_layout)
 
         p_row = QHBoxLayout()
@@ -310,26 +398,27 @@ class OnnMasterRemote(QWidget):
         elif key == Qt.Key.Key_Plus: self.send_key(24)
         else: super().keyPressEvent(event)
 
-    def toggle_monitor(self, checked):
-        if checked:
-            self.monitor_thread = EufyWebsocketWorker()
-            self.monitor_thread.motion_signal.connect(self.update_rec_status)
-            self.monitor_thread.log_signal.connect(self.update_cam_status)
-            self.monitor_thread.start()
-            self.btn_monitor.setText("Disable Camera Monitor")
-            self.btn_monitor.setProperty("class", "CamActive")
-        else:
-            if self.monitor_thread: self.monitor_thread.stop(); self.monitor_thread.wait()
-            self.update_rec_status(False); self.update_cam_status("Standby.")
-            self.btn_monitor.setText("Enable Camera Monitor")
-            self.btn_monitor.setProperty("class", "")
-        self.btn_monitor.style().unpolish(self.btn_monitor); self.btn_monitor.style().polish(self.btn_monitor)
-
     def update_rec_status(self, is_recording):
         color = "#ff1744" if is_recording else "#444"
         self.rec_light.setStyleSheet(f"color: {color}; font-weight: bold;")
+        
+        if is_recording:
+            cmd = (
+                'am broadcast -a de.cyberdream.androidtv.notifications.google.SEND '
+                '--es title "SECURITY ALERT" '
+                '--es msg "Motion detected at the front door!" '
+                '--ei type 2 '
+                '--ei duration 8 '
+                '--ei position 2'
+            )
+            try:
+                if not self.device: self.connect_to_device()
+                if self.device: self.device.shell(cmd)
+            except Exception as e:
+                print(f"Failed to send TV notification: {e}")
 
-    def update_cam_status(self, msg): self.cam_status.setText(msg)
+    def update_cam_status(self, msg): 
+        self.cam_status.setText(msg)
     
     def run_spellcheck(self, input_widget):
         if not spell: return
@@ -343,13 +432,14 @@ class OnnMasterRemote(QWidget):
         text = self.text_input.text()
         if text:
             self.text_input.add_to_history(text)
+            formatted_text = text.replace(' ', '%s')
+            cmd = f"input text {formatted_text} && sleep 0.5 && input keyevent 4"
             try:
                 if not self.device: self.connect_to_device()
-                self.device.shell(f"input text {text.replace(' ', '%s')}")
-                self.send_key(66)
+                self.device.shell(cmd)
             except:
                 self.connect_to_device()
-                if self.device: self.device.shell(f"input text {text.replace(' ', '%s')}")
+                if self.device: self.device.shell(cmd)
             self.text_input.clear(); self.text_input.clearFocus(); self.setFocus()
 
     def clear_tv_text(self):
@@ -411,8 +501,27 @@ class OnnMasterRemote(QWidget):
             self.status_label.setText(f"ONLINE: {self.ip}" if self.device else "OFFLINE")
         except: self.device = None; self.status_label.setText("OFFLINE")
 
+    def closeEvent(self, event):
+        if not self.is_quitting:
+            # Hide the window instead of quitting
+            event.ignore()
+            self.hide()
+            self.tray_icon.showMessage(
+                "ONN Master Remote",
+                "App minimized to system tray. Double-click to restore.",
+                QSystemTrayIcon.MessageIcon.Information,
+                2000
+            )
+        else:
+            # Clean exit if quit was clicked from the tray
+            super().closeEvent(event)
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    
+    # Crucial: Prevent PyQt6 from killing the app when the last window is hidden!
+    app.setQuitOnLastWindowClosed(False) 
+    
     window = OnnMasterRemote()
     window.show()
     sys.exit(app.exec())
